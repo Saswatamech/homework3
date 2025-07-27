@@ -4,6 +4,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 checkpoint = "HuggingFaceTB/SmolLM2-360M-Instruct"
+#checkpoint = "HuggingFaceTB/SmolLM2-1.7B-Instruct"
 
 device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
@@ -13,6 +14,7 @@ class BaseLLM:
         self.tokenizer = AutoTokenizer.from_pretrained(checkpoint)
         self.model = AutoModelForCausalLM.from_pretrained(checkpoint).to(device)
         self.device = device
+        self.tokenizer.padding_side = "left"
 
     def format_prompt(self, question: str) -> str:
         """
@@ -91,21 +93,99 @@ class BaseLLM:
                  outputs[:, len(inputs["input_ids"][0]) :]
         """
         from tqdm import tqdm  # Importing tqdm for progress bar
-
         # Preventing OOM
         # Depending on your GPU batched generation will use a lot of memory.
         # If you run out of memory, try to reduce the micro_batch_size.
-        micro_batch_size = 32
+        micro_batch_size = 16 # Reduced for potentially lower memory consumption with SmolLM2-360M
         if len(prompts) > micro_batch_size:
-            return [
-                r
-                for idx in tqdm(
-                    range(0, len(prompts), micro_batch_size), desc=f"LLM Running on Micro Batches {micro_batch_size}"
-                )
-                for r in self.batched_generate(prompts[idx : idx + micro_batch_size], num_return_sequences, temperature)
-            ]
+            all_generations = []
+            for idx in tqdm(
+                range(0, len(prompts), micro_batch_size), desc=f"LLM Running on Micro Batches {micro_batch_size}"
+            ):
+                micro_batch_prompts = prompts[idx : idx + micro_batch_size]
+                all_generations.extend(self.batched_generate(micro_batch_prompts, num_return_sequences, temperature))
+            return all_generations
 
-        raise NotImplementedError()
+        # Tokenize the prompts with padding=True and return_tensors="pt"
+        inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+        # Determine generation parameters
+        generation_kwargs = {
+            "max_new_tokens": 50,  # Set to a reasonable value
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "pad_token_id": self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id # Fallback
+        }
+
+        if temperature > 0:
+            generation_kwargs["do_sample"] = True
+            generation_kwargs["temperature"] = temperature
+            generation_kwargs["top_p"] = 0.9 # Common sampling parameter
+        else:
+            generation_kwargs["do_sample"] = False
+            # For greedy/beam search, num_beams > 1 would be used with do_sample=False
+            # If num_return_sequences is requested for greedy, it will return identical sequences
+            # unless a different strategy like diverse beam search is employed,
+            # but for this specific problem, it's implied num_return_sequences relates to sampling.
+
+        if num_return_sequences is not None:
+            generation_kwargs["num_return_sequences"] = num_return_sequences
+            # If num_return_sequences > 1, often num_beams is also set.
+            # However, if do_sample=True, num_return_sequences will return different samples.
+            # If do_sample=False and num_beams=1, num_return_sequences > 1 will return identical sequences.
+            # For the purpose of this problem, let's assume num_return_sequences is for sampling multiple outputs.
+
+
+        # Call self.model.generate
+        outputs = self.model.generate(
+            **inputs,
+            **generation_kwargs
+        )
+
+        # Calculate the length of the original input for each prompt in the batch
+        # This is the number of tokens before generation
+        # When padding_side="left", the original tokens are aligned to the right.
+        # The generated tokens are appended after these.
+        # Therefore, for each output sequence, the number of input tokens is the length of its corresponding original input.
+        # If input_ids are all of the same length due to padding and truncation, `inputs["input_ids"].shape[1]` can be used.
+        # However, for robustness, especially if truncation leads to varying original lengths,
+        # it's safer to determine the start of generation for each output.
+        # With padding_side="left", the original prompt tokens are at the end of the input_ids sequence,
+        # and the generated tokens follow.
+        # The total length of `outputs` will be `input_length + generated_length`.
+        # We need to find the `input_length` for each sequence.
+
+        # When `num_return_sequences > 1`, `model.generate` flattens the output.
+        # So `outputs` will have `len(prompts) * num_return_sequences` rows.
+        # Each row `outputs[k]` corresponds to `prompts[k // num_return_sequences]`.
+        # The input length for that row is `len(inputs["input_ids"][k // num_return_sequences])`.
+
+        decoded_generations = []
+        if num_return_sequences is not None:
+            for i in range(len(prompts)):
+                prompt_generations = []
+                for j in range(num_return_sequences):
+                    output_idx = i * num_return_sequences + j
+                    # Get the input length for the corresponding original prompt
+                    input_len_for_this_output = len(inputs["input_ids"][i])
+                    # Slice to get only the newly generated tokens
+                    generated_token_ids = outputs[output_idx, input_len_for_this_output:]
+                    decoded_text = self.tokenizer.decode(generated_token_ids, skip_special_tokens=True)
+                    prompt_generations.append(decoded_text.strip())
+                decoded_generations.append(prompt_generations)
+        else:
+            for i in range(len(prompts)):
+                # For single return sequence, outputs[i] corresponds to prompts[i]
+                input_len_for_this_output = len(inputs["input_ids"][i])
+                generated_token_ids = outputs[i, input_len_for_this_output:]
+                decoded_text = self.tokenizer.decode(generated_token_ids, skip_special_tokens=True)
+                decoded_generations.append(decoded_text.strip())
+
+        # Handle the return type based on num_return_sequences
+        if num_return_sequences is None:
+            return decoded_generations # list[str]
+        else:
+            return decoded_generations # list[list[str]]
 
     def answer(self, *questions) -> list[float]:
         """
